@@ -390,10 +390,10 @@ fn revisions_that_are_not_one_commit_are_trouble() {
             .assert_trouble("cannot resolve target");
         fixture
             .greb(&[&target, revision])
-            .assert_trouble("cannot resolve commit");
+            .assert_trouble("cannot resolve commit 1");
         fixture
             .greb(&[&target, &commit, revision])
-            .assert_trouble("cannot resolve commit");
+            .assert_trouble("cannot resolve commit 2");
     }
     assert!(!fixture.repo.join("greb-was-tricked").exists());
 }

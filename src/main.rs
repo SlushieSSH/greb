@@ -47,10 +47,25 @@ impl Outcome {
     }
 }
 
+#[derive(Clone, Copy)]
+enum Role {
+    Target,
+    Commit { position: usize },
+}
+
+impl fmt::Display for Role {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Target => formatter.write_str("target"),
+            Self::Commit { position } => write!(formatter, "commit {position}"),
+        }
+    }
+}
+
 enum Trouble {
     Usage,
     NotACommit {
-        role: &'static str,
+        role: Role,
     },
     RootCommit,
     ShallowCut,
@@ -120,7 +135,7 @@ fn git_stdout(command: &mut Command, subcommand: &'static str) -> Result<Vec<u8>
     Ok(output.stdout)
 }
 
-fn resolve_commit(revision: &OsStr, role: &'static str) -> Result<Oid, Trouble> {
+fn resolve_commit(revision: &OsStr, role: Role) -> Result<Oid, Trouble> {
     let mut peeled_revision = revision.to_owned();
     peeled_revision.push("^{commit}");
     let output = git()
@@ -210,11 +225,17 @@ fn simulate() -> Result<Outcome, Trouble> {
         [target, revisions @ ..] if !revisions.is_empty() => (target, revisions),
         _ => return Err(Trouble::Usage),
     };
-    let mut onto = resolve_commit(target, "target")?;
+    let mut onto = resolve_commit(target, Role::Target)?;
     let steps = revisions
         .iter()
-        .map(|revision| {
-            let commit = resolve_commit(revision, "commit")?;
+        .enumerate()
+        .map(|(index, revision)| {
+            let commit = resolve_commit(
+                revision,
+                Role::Commit {
+                    position: index + 1,
+                },
+            )?;
             let parent = single_parent(&commit)?;
             Ok((commit, parent))
         })
