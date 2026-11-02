@@ -26,9 +26,9 @@ impl Run {
         assert_eq!(self.stdout, format!("clean {expected_tree}\n"), "{self:?}");
     }
 
-    fn assert_conflict(&self) {
+    fn assert_conflict(&self, commit: &str) {
         assert_eq!(self.code, Some(1), "{self:?}");
-        assert_eq!(self.stdout, "conflict\n", "{self:?}");
+        assert_eq!(self.stdout, format!("conflict {commit}\n"), "{self:?}");
     }
 
     fn assert_trouble(&self, message: &str) {
@@ -114,17 +114,20 @@ impl Fixture {
         Run::capture(&output)
     }
 
-    fn cherry_pick_tree(&self, target: &str, commit: &str) -> String {
+    fn cherry_pick_tree(&self, target: &str, commits: &[&str]) -> String {
         self.git(&["checkout", "-q", "--detach", target]);
-        self.git(&["cherry-pick", commit]);
+        for commit in commits {
+            self.git(&["cherry-pick", commit]);
+        }
         self.git(&["rev-parse", "HEAD^{tree}"])
     }
 
-    fn assert_cherry_pick_conflicts(&self, target: &str, commit: &str) {
+    fn cherry_pick_stop(&self, target: &str, commits: &[&str]) -> String {
         self.git(&["checkout", "-q", "--detach", target]);
         let picked = self
             .in_repo("git")
-            .args(["cherry-pick", commit])
+            .arg("cherry-pick")
+            .args(commits)
             .output()
             .expect("git is installed");
         assert!(!picked.status.success(), "cherry-pick was expected to stop");
@@ -133,6 +136,7 @@ impl Fixture {
             !unmerged.is_empty(),
             "cherry-pick stopped without a conflict"
         );
+        self.git(&["rev-parse", "CHERRY_PICK_HEAD"])
     }
 }
 
@@ -177,7 +181,7 @@ fn clean_commit_gives_the_tree_cherry_pick_builds() {
 
     assert_eq!(fixture.git(&["rev-parse", "HEAD"]), target);
     assert_eq!(fixture.git(&["status", "--porcelain"]), "");
-    run.assert_clean(&fixture.cherry_pick_tree(&target, &commit));
+    run.assert_clean(&fixture.cherry_pick_tree(&target, &[&commit]));
 }
 
 #[test]
@@ -188,7 +192,7 @@ fn sha256_repo_gives_the_tree_cherry_pick_builds() {
 
     let run = fixture.greb(&[&target, &commit]);
 
-    run.assert_clean(&fixture.cherry_pick_tree(&target, &commit));
+    run.assert_clean(&fixture.cherry_pick_tree(&target, &[&commit]));
 }
 
 #[test]
@@ -203,8 +207,7 @@ fn conflicting_commit_stops_cherry_pick_too() {
     let run = fixture.greb(&[&target, &commit]);
 
     assert_eq!(fixture.git(&["status", "--porcelain"]), "");
-    run.assert_conflict();
-    fixture.assert_cherry_pick_conflicts(&target, &commit);
+    run.assert_conflict(&fixture.cherry_pick_stop(&target, &[&commit]));
 }
 
 #[test]
@@ -225,7 +228,7 @@ fn only_the_commits_own_change_is_replayed() {
 
     let run = fixture.greb(&[&target, &commit]);
 
-    run.assert_clean(&fixture.cherry_pick_tree(&target, &commit));
+    run.assert_clean(&fixture.cherry_pick_tree(&target, &[&commit]));
 }
 
 fn fixture_with_union_branch(name: &str) -> (Fixture, String, String, String) {
@@ -246,7 +249,7 @@ fn attributes_on_the_target_decide_a_clean_merge() {
 
     let run = fixture.greb(&[&union_target, &commit]);
 
-    run.assert_clean(&fixture.cherry_pick_tree(&union_target, &commit));
+    run.assert_clean(&fixture.cherry_pick_tree(&union_target, &[&commit]));
 }
 
 #[test]
@@ -255,8 +258,69 @@ fn attributes_in_the_checkout_cannot_fake_a_clean_merge() {
 
     let run = fixture.greb(&[&plain_target, &commit]);
 
-    run.assert_conflict();
-    fixture.assert_cherry_pick_conflicts(&plain_target, &commit);
+    run.assert_conflict(&fixture.cherry_pick_stop(&plain_target, &[&commit]));
+}
+
+#[test]
+fn each_commit_lands_on_the_one_before_it() {
+    let fixture = Fixture::new("chain");
+    fixture.commit(&[("notes.txt", "one\n"), ("other.txt", "base\n")]);
+    fixture.git(&["switch", "-q", "-c", "feature"]);
+    let first = fixture.commit(&[("notes.txt", "one\ntwo\n")]);
+    let second = fixture.commit(&[("notes.txt", "one\ntwo\nthree\n")]);
+    fixture.git(&["switch", "-q", "main"]);
+    let target = fixture.commit(&[("other.txt", "target\n")]);
+    fixture.greb(&[&target, &second]).assert_conflict(&second);
+
+    let run = fixture.greb(&[&target, &first, &second]);
+
+    run.assert_clean(&fixture.cherry_pick_tree(&target, &[&first, &second]));
+}
+
+#[test]
+fn replay_stops_at_the_first_conflict() {
+    let fixture = Fixture::new("first-conflict");
+    fixture.commit(&[("shared.txt", "base\n"), ("other.txt", "base\n")]);
+    fixture.git(&["switch", "-q", "-c", "feature"]);
+    let first = fixture.commit(&[("shared.txt", "feature\n")]);
+    let second = fixture.commit(&[("other.txt", "feature\n")]);
+    fixture.git(&["switch", "-q", "main"]);
+    let target = fixture.commit(&[("shared.txt", "target\n")]);
+
+    let run = fixture.greb(&[&target, &first, &second]);
+
+    run.assert_conflict(&fixture.cherry_pick_stop(&target, &[&first, &second]));
+}
+
+#[test]
+fn conflict_names_the_commit_that_stopped() {
+    let fixture = Fixture::new("later-conflict");
+    fixture.commit(&[("shared.txt", "base\n"), ("other.txt", "base\n")]);
+    fixture.git(&["switch", "-q", "-c", "feature"]);
+    let first = fixture.commit(&[("other.txt", "feature\n")]);
+    let second = fixture.commit(&[("shared.txt", "feature\n")]);
+    fixture.git(&["switch", "-q", "main"]);
+    let target = fixture.commit(&[("shared.txt", "target\n")]);
+
+    let run = fixture.greb(&[&target, &first, &second]);
+
+    run.assert_conflict(&fixture.cherry_pick_stop(&target, &[&first, &second]));
+}
+
+#[test]
+fn attributes_from_an_earlier_commit_apply_to_later_ones() {
+    let fixture = Fixture::new("attr-chain");
+    fixture.commit(&[("notes.txt", "base\n")]);
+    fixture.git(&["switch", "-q", "-c", "feature"]);
+    let attributes = fixture.commit(&[(".gitattributes", "notes.txt merge=union\n")]);
+    let edit = fixture.commit(&[("notes.txt", "feature\n")]);
+    fixture.git(&["switch", "-q", "main"]);
+    let target = fixture.commit(&[("notes.txt", "target\n")]);
+    fixture.greb(&[&target, &edit]).assert_conflict(&edit);
+
+    let run = fixture.greb(&[&target, &attributes, &edit]);
+
+    run.assert_clean(&fixture.cherry_pick_tree(&target, &[&attributes, &edit]));
 }
 
 #[test]
@@ -264,7 +328,7 @@ fn inherited_git_variables_cannot_redirect_greb() {
     let fixture = Fixture::new("inherited");
     let (target, commit) = diverged_on_two_files(&fixture);
     let missing = fixture.home.join("missing");
-    let expected_tree = fixture.cherry_pick_tree(&target, &commit);
+    let expected_tree = fixture.cherry_pick_tree(&target, &[&commit]);
 
     for variable in [
         "GIT_DIR",
@@ -327,6 +391,9 @@ fn revisions_that_are_not_one_commit_are_trouble() {
         fixture
             .greb(&[&target, revision])
             .assert_trouble("cannot resolve commit");
+        fixture
+            .greb(&[&target, &commit, revision])
+            .assert_trouble("cannot resolve commit");
     }
     assert!(!fixture.repo.join("greb-was-tricked").exists());
 }
@@ -339,7 +406,7 @@ fn ref_named_like_an_option_is_still_a_ref() {
 
     let run = fixture.greb(&["-dash", &commit]);
 
-    run.assert_clean(&fixture.cherry_pick_tree(&target, &commit));
+    run.assert_clean(&fixture.cherry_pick_tree(&target, &[&commit]));
 }
 
 #[test]
@@ -428,10 +495,10 @@ fn merge_commit_is_trouble_not_a_guess() {
 fn wrong_argument_count_is_trouble() {
     let fixture = Fixture::new("arguments");
 
-    for arguments in [&[][..], &["main"][..], &["main", "main", "main"][..]] {
+    for arguments in [&[][..], &["main"][..]] {
         fixture
             .greb(arguments)
-            .assert_trouble("usage: greb <target> <commit>");
+            .assert_trouble("usage: greb <target> <commit>...");
     }
 }
 

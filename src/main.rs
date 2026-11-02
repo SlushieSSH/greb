@@ -35,14 +35,14 @@ impl fmt::Display for Oid {
 
 enum Outcome {
     Clean { tree: Oid },
-    Conflict,
+    Conflict { commit: Oid },
 }
 
 impl Outcome {
     fn exit_code(&self) -> ExitCode {
         match self {
             Self::Clean { .. } => ExitCode::SUCCESS,
-            Self::Conflict => ExitCode::from(CONFLICT_EXIT_CODE),
+            Self::Conflict { .. } => ExitCode::from(CONFLICT_EXIT_CODE),
         }
     }
 }
@@ -75,7 +75,7 @@ impl From<io::Error> for Trouble {
 impl fmt::Display for Trouble {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Usage => write!(formatter, "usage: greb <target> <commit>"),
+            Self::Usage => write!(formatter, "usage: greb <target> <commit>..."),
             Self::NotACommit { role } => write!(formatter, "cannot resolve {role}"),
             Self::RootCommit => write!(formatter, "root commits are not supported"),
             Self::ShallowCut => {
@@ -168,18 +168,18 @@ fn single_parent(commit: &Oid) -> Result<Oid, Trouble> {
     })
 }
 
-fn replay(target: &Oid, commit: &Oid, parent: &Oid) -> Result<Outcome, Trouble> {
+fn replay(onto: &Oid, commit: Oid, parent: &Oid) -> Result<Outcome, Trouble> {
     const SUBCOMMAND: &str = "merge-tree";
     let mut attribute_source = OsString::from("--attr-source=");
-    attribute_source.push(target);
+    attribute_source.push(onto);
     let mut merge_base = OsString::from("--merge-base=");
     merge_base.push(parent);
     let output = git()
         .arg(attribute_source)
         .args([SUBCOMMAND, "--write-tree", "-z"])
         .arg(merge_base)
-        .arg(target)
-        .arg(commit)
+        .arg(onto)
+        .arg(&commit)
         .output()?;
     let is_conflict = match output.status.code() {
         Some(0) => false,
@@ -198,29 +198,41 @@ fn replay(target: &Oid, commit: &Oid, parent: &Oid) -> Result<Outcome, Trouble> 
             subcommand: SUBCOMMAND,
         })?;
     Ok(if is_conflict {
-        Outcome::Conflict
+        Outcome::Conflict { commit }
     } else {
         Outcome::Clean { tree }
     })
 }
 
 fn simulate() -> Result<Outcome, Trouble> {
-    let mut arguments = env::args_os().skip(1);
-    let (Some(target), Some(commit), None) = (arguments.next(), arguments.next(), arguments.next())
-    else {
-        return Err(Trouble::Usage);
+    let arguments: Vec<OsString> = env::args_os().skip(1).collect();
+    let (target, revisions) = match arguments.as_slice() {
+        [target, revisions @ ..] if !revisions.is_empty() => (target, revisions),
+        _ => return Err(Trouble::Usage),
     };
-    let target = resolve_commit(&target, "target")?;
-    let commit = resolve_commit(&commit, "commit")?;
-    let parent = single_parent(&commit)?;
-    replay(&target, &commit, &parent)
+    let mut onto = resolve_commit(target, "target")?;
+    let steps = revisions
+        .iter()
+        .map(|revision| {
+            let commit = resolve_commit(revision, "commit")?;
+            let parent = single_parent(&commit)?;
+            Ok((commit, parent))
+        })
+        .collect::<Result<Vec<_>, Trouble>>()?;
+    for (commit, parent) in steps {
+        match replay(&onto, commit, &parent)? {
+            Outcome::Clean { tree } => onto = tree,
+            conflict @ Outcome::Conflict { .. } => return Ok(conflict),
+        }
+    }
+    Ok(Outcome::Clean { tree: onto })
 }
 
 fn print_outcome(outcome: &Outcome) -> io::Result<()> {
     let mut stdout = io::stdout().lock();
     match outcome {
         Outcome::Clean { tree } => writeln!(stdout, "clean {tree}"),
-        Outcome::Conflict => writeln!(stdout, "conflict"),
+        Outcome::Conflict { commit } => writeln!(stdout, "conflict {commit}"),
     }
 }
 
