@@ -124,19 +124,31 @@ impl Fixture {
 
     fn cherry_pick_stop(&self, target: &str, commits: &[&str]) -> String {
         self.git(&["checkout", "-q", "--detach", target]);
-        let picked = self
-            .in_repo("git")
-            .arg("cherry-pick")
-            .args(commits)
-            .output()
-            .expect("git is installed");
-        assert!(!picked.status.success(), "cherry-pick was expected to stop");
+        let mut cherry_pick = self.in_repo("git");
+        cherry_pick.arg("cherry-pick").args(commits);
+        self.stop_on_conflict(cherry_pick, "CHERRY_PICK_HEAD")
+    }
+
+    fn rebase_tree(&self, target: &str) -> String {
+        self.git(&["rebase", "-q", target]);
+        self.git(&["rev-parse", "HEAD^{tree}"])
+    }
+
+    fn rebase_stop(&self, target: &str) -> String {
+        let mut rebase = self.in_repo("git");
+        rebase.args(["rebase", "-q", target]);
+        self.stop_on_conflict(rebase, "REBASE_HEAD")
+    }
+
+    fn stop_on_conflict(&self, mut command: Command, stopped_at: &str) -> String {
+        let output = command.output().expect("git is installed");
+        assert!(!output.status.success(), "{command:?} was expected to stop");
         let unmerged = self.git(&["diff", "--name-only", "--diff-filter=U"]);
         assert!(
             !unmerged.is_empty(),
-            "cherry-pick stopped without a conflict"
+            "{command:?} stopped without a conflict"
         );
-        self.git(&["rev-parse", "CHERRY_PICK_HEAD"])
+        self.git(&["rev-parse", stopped_at])
     }
 }
 
@@ -324,6 +336,107 @@ fn attributes_from_an_earlier_commit_apply_to_later_ones() {
 }
 
 #[test]
+fn target_alone_replays_head_like_git_rebase() {
+    let fixture = Fixture::new("rebase-clean");
+    fixture.commit(&[("notes.txt", "one\n"), ("shared.txt", "base\n")]);
+    fixture.git(&["switch", "-q", "-c", "feature"]);
+    fixture.commit(&[("notes.txt", "one\ntwo\n")]);
+    let second = fixture.commit(&[("notes.txt", "one\ntwo\nthree\n")]);
+    fixture.git(&["switch", "-q", "main"]);
+    let first_target = fixture.commit(&[("shared.txt", "target one\n")]);
+    fixture.commit(&[("shared.txt", "target two\n")]);
+    fixture.greb(&["main", &second]).assert_conflict(&second);
+    fixture
+        .greb(&["main", &first_target])
+        .assert_conflict(&first_target);
+    fixture.git(&["switch", "-q", "feature"]);
+
+    let run = fixture.greb(&["main"]);
+
+    run.assert_clean(&fixture.rebase_tree("main"));
+}
+
+#[test]
+fn target_alone_stops_where_git_rebase_stops() {
+    let fixture = Fixture::new("rebase-conflict");
+    fixture.commit(&[("shared.txt", "base\n"), ("other.txt", "base\n")]);
+    fixture.git(&["switch", "-q", "-c", "feature"]);
+    fixture.commit(&[("other.txt", "feature\n")]);
+    fixture.commit(&[("shared.txt", "feature\n")]);
+    fixture.git(&["switch", "-q", "main"]);
+    fixture.commit(&[("shared.txt", "target\n")]);
+    fixture.git(&["switch", "-q", "feature"]);
+
+    let run = fixture.greb(&["main"]);
+
+    run.assert_conflict(&fixture.rebase_stop("main"));
+}
+
+#[test]
+fn commits_already_on_the_target_are_skipped() {
+    let fixture = Fixture::new("rebase-skip");
+    fixture.commit(&[("shared.txt", "base\n"), ("other.txt", "base\n")]);
+    fixture.git(&["switch", "-q", "-c", "feature"]);
+    let picked = fixture.commit(&[("shared.txt", "feature\n")]);
+    fixture.commit(&[("other.txt", "feature\n")]);
+    fixture.git(&["switch", "-q", "main"]);
+    fixture.git(&["cherry-pick", "-x", &picked]);
+    assert_ne!(fixture.git(&["rev-parse", "HEAD"]), picked);
+    fixture.commit(&[("shared.txt", "feature\nmore\n")]);
+    fixture.greb(&["main", &picked]).assert_conflict(&picked);
+    fixture.git(&["switch", "-q", "feature"]);
+
+    let run = fixture.greb(&["main"]);
+
+    run.assert_clean(&fixture.rebase_tree("main"));
+}
+
+#[test]
+fn merges_on_the_branch_are_flattened_like_git_rebase() {
+    let fixture = Fixture::new("rebase-merges");
+    fixture.commit(&[("a.txt", "base\n"), ("b.txt", "base\n")]);
+    fixture.git(&["switch", "-q", "-c", "side"]);
+    fixture.commit(&[("c.txt", "side\n")]);
+    fixture.git(&["switch", "-q", "-c", "feature", "main"]);
+    fixture.commit(&[("a.txt", "feature\n")]);
+    fixture.git(&["merge", "-q", "--no-ff", "-m", "fixture merge", "side"]);
+    fixture.commit(&[("d.txt", "after\n")]);
+    fixture.git(&["switch", "-q", "main"]);
+    fixture.commit(&[("b.txt", "target\n")]);
+    fixture.git(&["switch", "-q", "feature"]);
+
+    let run = fixture.greb(&["main"]);
+
+    run.assert_clean(&fixture.rebase_tree("main"));
+}
+
+#[test]
+fn head_already_in_the_target_gives_the_target_tree() {
+    let Diverged { fixture, base, .. } = diverged_on_one_file("rebase-behind");
+    fixture.git(&["checkout", "-q", "--detach", &base]);
+
+    let run = fixture.greb(&["main"]);
+
+    run.assert_clean(&fixture.rebase_tree("main"));
+}
+
+#[test]
+fn unborn_head_is_trouble() {
+    let Diverged { fixture, .. } = diverged_on_one_file("unborn");
+    fixture.git(&["switch", "-q", "--orphan", "empty"]);
+    let probe = fixture
+        .in_repo("git")
+        .args(["rev-parse", "--verify", "-q", "HEAD"])
+        .output()
+        .expect("git is installed");
+    assert!(!probe.status.success(), "HEAD must be unborn here");
+
+    fixture
+        .greb(&["main"])
+        .assert_trouble("cannot resolve HEAD");
+}
+
+#[test]
 fn inherited_git_variables_cannot_redirect_greb() {
     let fixture = Fixture::new("inherited");
     let (target, commit) = diverged_on_two_files(&fixture);
@@ -492,14 +605,12 @@ fn merge_commit_is_trouble_not_a_guess() {
 }
 
 #[test]
-fn wrong_argument_count_is_trouble() {
+fn no_arguments_is_trouble() {
     let fixture = Fixture::new("arguments");
 
-    for arguments in [&[][..], &["main"][..]] {
-        fixture
-            .greb(arguments)
-            .assert_trouble("usage: greb <target> <commit>...");
-    }
+    fixture
+        .greb(&[])
+        .assert_trouble("usage: greb <target> [<commit>...]");
 }
 
 #[test]
@@ -533,7 +644,7 @@ fn outside_a_repository_is_trouble() {
 fn git_failure_is_trouble_not_a_verdict() {
     let fixture = Fixture::new("corrupt");
     let (target, commit) = diverged_on_two_files(&fixture);
-    let tree = fixture.git(&["rev-parse", &format!("{target}^{{tree}}")]);
+    let tree = fixture.git(&["rev-parse", &format!("{commit}^{{tree}}")]);
     let (directory, file) = tree.split_at(2);
     let tree_object = fixture
         .repo

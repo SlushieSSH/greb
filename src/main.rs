@@ -50,6 +50,7 @@ impl Outcome {
 #[derive(Clone, Copy)]
 enum Role {
     Target,
+    Head,
     Commit { position: usize },
 }
 
@@ -57,6 +58,7 @@ impl fmt::Display for Role {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Target => formatter.write_str("target"),
+            Self::Head => formatter.write_str("HEAD"),
             Self::Commit { position } => write!(formatter, "commit {position}"),
         }
     }
@@ -90,7 +92,7 @@ impl From<io::Error> for Trouble {
 impl fmt::Display for Trouble {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Usage => write!(formatter, "usage: greb <target> <commit>..."),
+            Self::Usage => write!(formatter, "usage: greb <target> [<commit>...]"),
             Self::NotACommit { role } => write!(formatter, "cannot resolve {role}"),
             Self::RootCommit => write!(formatter, "root commits are not supported"),
             Self::ShallowCut => {
@@ -135,9 +137,9 @@ fn git_stdout(command: &mut Command, subcommand: &'static str) -> Result<Vec<u8>
     Ok(output.stdout)
 }
 
-fn resolve_commit(revision: &OsStr, role: Role) -> Result<Oid, Trouble> {
+fn resolve(revision: &OsStr, peel: &str, role: Role) -> Result<Oid, Trouble> {
     let mut peeled_revision = revision.to_owned();
-    peeled_revision.push("^{commit}");
+    peeled_revision.push(peel);
     let output = git()
         .args(["rev-parse", "--verify", "--end-of-options"])
         .arg(peeled_revision)
@@ -183,6 +185,37 @@ fn single_parent(commit: &Oid) -> Result<Oid, Trouble> {
     })
 }
 
+fn rebased_commits(target: &Oid, head: &Oid) -> Result<Vec<Oid>, Trouble> {
+    const SUBCOMMAND: &str = "rev-list";
+    let mut range = OsString::from(target);
+    range.push("...");
+    range.push(head);
+    let stdout = git_stdout(
+        git()
+            .args([
+                SUBCOMMAND,
+                "--reverse",
+                "--topo-order",
+                "--no-merges",
+                "--right-only",
+                "--cherry-pick",
+                "--end-of-options",
+            ])
+            .arg(range)
+            .arg("--"),
+        SUBCOMMAND,
+    )?;
+    stdout
+        .split(u8::is_ascii_whitespace)
+        .filter(|line| !line.is_empty())
+        .map(|line| {
+            Oid::parse(line).ok_or(Trouble::UnexpectedOutput {
+                subcommand: SUBCOMMAND,
+            })
+        })
+        .collect()
+}
+
 fn replay(onto: &Oid, commit: Oid, parent: &Oid) -> Result<Outcome, Trouble> {
     const SUBCOMMAND: &str = "merge-tree";
     let mut attribute_source = OsString::from("--attr-source=");
@@ -221,25 +254,31 @@ fn replay(onto: &Oid, commit: Oid, parent: &Oid) -> Result<Outcome, Trouble> {
 
 fn simulate() -> Result<Outcome, Trouble> {
     let arguments: Vec<OsString> = env::args_os().skip(1).collect();
-    let (target, revisions) = match arguments.as_slice() {
-        [target, revisions @ ..] if !revisions.is_empty() => (target, revisions),
-        _ => return Err(Trouble::Usage),
+    let [target, revisions @ ..] = arguments.as_slice() else {
+        return Err(Trouble::Usage);
     };
-    let mut onto = resolve_commit(target, Role::Target)?;
-    let steps = revisions
-        .iter()
-        .enumerate()
-        .map(|(index, revision)| {
-            let commit = resolve_commit(
-                revision,
-                Role::Commit {
-                    position: index + 1,
-                },
-            )?;
+    let target = resolve(target, "^{commit}", Role::Target)?;
+    let commits = if revisions.is_empty() {
+        let head = resolve(OsStr::new("HEAD"), "^{commit}", Role::Head)?;
+        rebased_commits(&target, &head)?
+    } else {
+        revisions
+            .iter()
+            .enumerate()
+            .map(|(index, revision)| {
+                let position = index + 1;
+                resolve(revision, "^{commit}", Role::Commit { position })
+            })
+            .collect::<Result<Vec<_>, Trouble>>()?
+    };
+    let steps = commits
+        .into_iter()
+        .map(|commit| {
             let parent = single_parent(&commit)?;
             Ok((commit, parent))
         })
         .collect::<Result<Vec<_>, Trouble>>()?;
+    let mut onto = resolve(target.as_ref(), "^{tree}", Role::Target)?;
     for (commit, parent) in steps {
         match replay(&onto, commit, &parent)? {
             Outcome::Clean { tree } => onto = tree,
