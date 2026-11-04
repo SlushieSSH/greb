@@ -26,9 +26,16 @@ impl Run {
         assert_eq!(self.stdout, format!("clean {expected_tree}\n"), "{self:?}");
     }
 
-    fn assert_conflict(&self, commit: &str) {
+    fn assert_conflict(&self, stop: &Stop) {
         assert_eq!(self.code, Some(1), "{self:?}");
-        assert_eq!(self.stdout, format!("conflict {commit}\n"), "{self:?}");
+        let expected = format!("conflict {}\n{}\n", stop.commit, stop.unmerged);
+        assert_eq!(self.stdout, expected, "{self:?}");
+    }
+
+    fn assert_stopped_at(&self, commit: &str) {
+        assert_eq!(self.code, Some(1), "{self:?}");
+        let first_line = format!("conflict {commit}\n");
+        assert!(self.stdout.starts_with(&first_line), "{self:?}");
     }
 
     fn assert_trouble(&self, message: &str) {
@@ -36,6 +43,11 @@ impl Run {
         assert_eq!(self.stdout, "", "{self:?}");
         assert_eq!(self.stderr, format!("greb: {message}\n"), "{self:?}");
     }
+}
+
+struct Stop {
+    commit: String,
+    unmerged: String,
 }
 
 struct Fixture {
@@ -122,7 +134,7 @@ impl Fixture {
         self.git(&["rev-parse", "HEAD^{tree}"])
     }
 
-    fn cherry_pick_stop(&self, target: &str, commits: &[&str]) -> String {
+    fn cherry_pick_stop(&self, target: &str, commits: &[&str]) -> Stop {
         self.git(&["checkout", "-q", "--detach", target]);
         let mut cherry_pick = self.in_repo("git");
         cherry_pick.arg("cherry-pick").args(commits);
@@ -134,13 +146,13 @@ impl Fixture {
         self.git(&["rev-parse", "HEAD^{tree}"])
     }
 
-    fn rebase_stop(&self, target: &str) -> String {
+    fn rebase_stop(&self, target: &str) -> Stop {
         let mut rebase = self.in_repo("git");
         rebase.args(["rebase", "-q", target]);
         self.stop_on_conflict(rebase, "REBASE_HEAD")
     }
 
-    fn stop_on_conflict(&self, mut command: Command, stopped_at: &str) -> String {
+    fn stop_on_conflict(&self, mut command: Command, stopped_at: &str) -> Stop {
         let output = command.output().expect("git is installed");
         assert!(!output.status.success(), "{command:?} was expected to stop");
         let unmerged = self.git(&["diff", "--name-only", "--diff-filter=U"]);
@@ -148,7 +160,10 @@ impl Fixture {
             !unmerged.is_empty(),
             "{command:?} stopped without a conflict"
         );
-        self.git(&["rev-parse", stopped_at])
+        Stop {
+            commit: self.git(&["rev-parse", stopped_at]),
+            unmerged,
+        }
     }
 }
 
@@ -223,6 +238,79 @@ fn conflicting_commit_stops_cherry_pick_too() {
 }
 
 #[test]
+fn conflict_lists_the_files_git_leaves_unmerged() {
+    let fixture = Fixture::new("unmerged-files");
+    fs::create_dir(fixture.repo.join("docs")).expect("the fixture repo is writable");
+    let files = ["a.txt", "b.txt", "c.txt", "docs/read me.txt"];
+    fixture.commit(&files.map(|name| (name, "base\n")));
+    fixture.git(&["switch", "-q", "-c", "feature"]);
+    fixture.git(&["rm", "-q", "b.txt"]);
+    let commit = fixture.commit(&[
+        ("a.txt", "feature\n"),
+        ("c.txt", "feature\n"),
+        ("docs/read me.txt", "feature\n"),
+    ]);
+    fixture.git(&["switch", "-q", "main"]);
+    let target = fixture.commit(&[
+        ("a.txt", "target\n"),
+        ("b.txt", "target\n"),
+        ("docs/read me.txt", "target\n"),
+    ]);
+
+    let run = fixture.greb(&[&target, &commit]);
+
+    let stop = fixture.cherry_pick_stop(&target, &[&commit]);
+    assert_eq!(stop.unmerged.lines().count(), 3);
+    run.assert_conflict(&stop);
+}
+
+fn commit_without_checkout(
+    fixture: &Fixture,
+    path: &str,
+    contents: &str,
+    parents: &[&str],
+) -> String {
+    let blob_file = fixture.home.join("blob");
+    fs::write(&blob_file, contents).expect("home is writable");
+    let blob_path = blob_file.to_str().expect("fixture paths are UTF-8");
+    let blob = fixture.git(&["hash-object", "-w", blob_path]);
+    let cacheinfo = format!("100644,{blob},{path}");
+    fixture.git(&[
+        "-c",
+        "core.protectNTFS=false",
+        "update-index",
+        "--add",
+        "--cacheinfo",
+        &cacheinfo,
+    ]);
+    let tree = fixture.git(&["write-tree"]);
+    let mut arguments = vec!["commit-tree", &tree, "-m", "fixture commit"];
+    for parent in parents {
+        arguments.extend(["-p", parent]);
+    }
+    fixture.git(&arguments)
+}
+
+#[test]
+fn file_names_cannot_send_terminal_controls() {
+    let fixture = Fixture::new("hostile-name");
+    let name = "\u{1b}[31mred\rcover\u{202e}txt.exe";
+    let base = commit_without_checkout(&fixture, name, "base\n", &[]);
+    let commit = commit_without_checkout(&fixture, name, "feature\n", &[&base]);
+    let target = commit_without_checkout(&fixture, name, "target\n", &[&base]);
+
+    let run = fixture.greb(&[&target, &commit]);
+
+    assert_eq!(run.code, Some(1), "{run:?}");
+    let escaped = r"\u{1b}[31mred\u{d}cover\u{202e}txt.exe";
+    assert_eq!(
+        run.stdout,
+        format!("conflict {commit}\n{escaped}\n"),
+        "{run:?}"
+    );
+}
+
+#[test]
 fn only_the_commits_own_change_is_replayed() {
     let fixture = Fixture::new("own-change");
     fixture.commit(&[("shared.txt", "base\n"), ("other.txt", "base\n")]);
@@ -282,7 +370,7 @@ fn each_commit_lands_on_the_one_before_it() {
     let second = fixture.commit(&[("notes.txt", "one\ntwo\nthree\n")]);
     fixture.git(&["switch", "-q", "main"]);
     let target = fixture.commit(&[("other.txt", "target\n")]);
-    fixture.greb(&[&target, &second]).assert_conflict(&second);
+    fixture.greb(&[&target, &second]).assert_stopped_at(&second);
 
     let run = fixture.greb(&[&target, &first, &second]);
 
@@ -328,7 +416,7 @@ fn attributes_from_an_earlier_commit_apply_to_later_ones() {
     let edit = fixture.commit(&[("notes.txt", "feature\n")]);
     fixture.git(&["switch", "-q", "main"]);
     let target = fixture.commit(&[("notes.txt", "target\n")]);
-    fixture.greb(&[&target, &edit]).assert_conflict(&edit);
+    fixture.greb(&[&target, &edit]).assert_stopped_at(&edit);
 
     let run = fixture.greb(&[&target, &attributes, &edit]);
 
@@ -345,10 +433,10 @@ fn target_alone_replays_head_like_git_rebase() {
     fixture.git(&["switch", "-q", "main"]);
     let first_target = fixture.commit(&[("shared.txt", "target one\n")]);
     fixture.commit(&[("shared.txt", "target two\n")]);
-    fixture.greb(&["main", &second]).assert_conflict(&second);
+    fixture.greb(&["main", &second]).assert_stopped_at(&second);
     fixture
         .greb(&["main", &first_target])
-        .assert_conflict(&first_target);
+        .assert_stopped_at(&first_target);
     fixture.git(&["switch", "-q", "feature"]);
 
     let run = fixture.greb(&["main"]);
@@ -383,7 +471,7 @@ fn commits_already_on_the_target_are_skipped() {
     fixture.git(&["cherry-pick", "-x", &picked]);
     assert_ne!(fixture.git(&["rev-parse", "HEAD"]), picked);
     fixture.commit(&[("shared.txt", "feature\nmore\n")]);
-    fixture.greb(&["main", &picked]).assert_conflict(&picked);
+    fixture.greb(&["main", &picked]).assert_stopped_at(&picked);
     fixture.git(&["switch", "-q", "feature"]);
 
     let run = fixture.greb(&["main"]);

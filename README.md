@@ -9,9 +9,10 @@ $ greb main
 clean 592badaeae0a2460c668e21de3ba6b8f58e35e27
 $ greb main hotfix~1 hotfix
 conflict 19bd83250202ca764b1c26275bf47e43f8949497
+src/net/http.rs
 ```
 
-`clean` exits 0 with the final tree id, and `conflict` exits 1 with the commit greb stopped on but no file names
+`clean` exits 0 with the final tree id, and `conflict` exits 1 with the commit greb stopped on, then each file that conflicted on its own line
 
 When greb can't answer it prints `greb: <reason>` to stderr and exits 2, which root commits and listed merges always cause and shallow or blobless clones sometimes do
 

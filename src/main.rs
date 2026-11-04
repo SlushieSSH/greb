@@ -33,9 +33,28 @@ impl fmt::Display for Oid {
     }
 }
 
+struct RepoPath(Vec<u8>);
+
+impl fmt::Display for RepoPath {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for character in String::from_utf8_lossy(&self.0).chars() {
+            let is_bidi_control = matches!(
+                character,
+                '\u{61c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}'
+            );
+            if character.is_control() || is_bidi_control {
+                write!(formatter, "{}", character.escape_unicode())?;
+            } else {
+                write!(formatter, "{character}")?;
+            }
+        }
+        Ok(())
+    }
+}
+
 enum Outcome {
     Clean { tree: Oid },
-    Conflict { commit: Oid },
+    Conflict { commit: Oid, paths: Vec<RepoPath> },
 }
 
 impl Outcome {
@@ -224,7 +243,7 @@ fn replay(onto: &Oid, commit: Oid, parent: &Oid) -> Result<Outcome, Trouble> {
     merge_base.push(parent);
     let output = git()
         .arg(attribute_source)
-        .args([SUBCOMMAND, "--write-tree", "-z"])
+        .args([SUBCOMMAND, "--write-tree", "-z", "--name-only"])
         .arg(merge_base)
         .arg(onto)
         .arg(&commit)
@@ -239,14 +258,19 @@ fn replay(onto: &Oid, commit: Oid, parent: &Oid) -> Result<Outcome, Trouble> {
             });
         }
     };
-    let first_field = output.stdout.split(|byte| *byte == 0).next();
-    let tree = first_field
+    let mut fields = output.stdout.split(|byte| *byte == 0);
+    let tree = fields
+        .next()
         .and_then(Oid::parse)
         .ok_or(Trouble::UnexpectedOutput {
             subcommand: SUBCOMMAND,
         })?;
     Ok(if is_conflict {
-        Outcome::Conflict { commit }
+        let paths = fields
+            .take_while(|field| !field.is_empty())
+            .map(|field| RepoPath(field.to_vec()))
+            .collect();
+        Outcome::Conflict { commit, paths }
     } else {
         Outcome::Clean { tree }
     })
@@ -292,7 +316,13 @@ fn print_outcome(outcome: &Outcome) -> io::Result<()> {
     let mut stdout = io::stdout().lock();
     match outcome {
         Outcome::Clean { tree } => writeln!(stdout, "clean {tree}"),
-        Outcome::Conflict { commit } => writeln!(stdout, "conflict {commit}"),
+        Outcome::Conflict { commit, paths } => {
+            writeln!(stdout, "conflict {commit}")?;
+            for path in paths {
+                writeln!(stdout, "{path}")?;
+            }
+            Ok(())
+        }
     }
 }
 
