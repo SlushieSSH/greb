@@ -7,6 +7,7 @@ use std::process::{Command, ExitCode, ExitStatus, Stdio};
 const CONFLICT_EXIT_CODE: u8 = 1;
 const TROUBLE_EXIT_CODE: u8 = 2;
 
+#[derive(Clone)]
 struct Oid(String);
 
 impl Oid {
@@ -88,9 +89,15 @@ enum Trouble {
     NotACommit {
         role: Role,
     },
-    RootCommit,
-    ShallowCut,
-    MergeCommit,
+    RootCommit {
+        commit: Oid,
+    },
+    ShallowCut {
+        commit: Oid,
+    },
+    MergeCommit {
+        commit: Oid,
+    },
     GitNotRun(io::Error),
     GitFailed {
         subcommand: &'static str,
@@ -113,14 +120,18 @@ impl fmt::Display for Trouble {
         match self {
             Self::Usage => write!(formatter, "usage: greb <target> [<commit>...]"),
             Self::NotACommit { role } => write!(formatter, "cannot resolve {role}"),
-            Self::RootCommit => write!(formatter, "root commits are not supported"),
-            Self::ShallowCut => {
+            Self::RootCommit { commit } => {
+                write!(formatter, "root commit {commit} is not supported")
+            }
+            Self::ShallowCut { commit } => {
                 write!(
                     formatter,
-                    "parent of commit is missing from this shallow clone"
+                    "parent of {commit} is missing from this shallow clone"
                 )
             }
-            Self::MergeCommit => write!(formatter, "merge commits are not supported"),
+            Self::MergeCommit { commit } => {
+                write!(formatter, "merge commit {commit} is not supported")
+            }
             Self::GitNotRun(error) => write!(formatter, "cannot run git: {error}"),
             Self::GitFailed { subcommand, status } => {
                 write!(formatter, "git {subcommand} failed with {status}")
@@ -190,14 +201,16 @@ fn single_parent(commit: &Oid) -> Result<Oid, Trouble> {
     )?;
     let mut parents = stdout.trim_ascii().split(u8::is_ascii_whitespace).skip(1);
     let Some(parent) = parents.next() else {
-        return Err(if has_recorded_parent(commit)? {
-            Trouble::ShallowCut
+        let commit = commit.clone();
+        return Err(if has_recorded_parent(&commit)? {
+            Trouble::ShallowCut { commit }
         } else {
-            Trouble::RootCommit
+            Trouble::RootCommit { commit }
         });
     };
     if parents.next().is_some() {
-        return Err(Trouble::MergeCommit);
+        let commit = commit.clone();
+        return Err(Trouble::MergeCommit { commit });
     }
     Oid::parse(parent).ok_or(Trouble::UnexpectedOutput {
         subcommand: SUBCOMMAND,

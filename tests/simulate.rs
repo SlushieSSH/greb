@@ -622,7 +622,19 @@ fn root_commit_is_trouble_not_a_guess() {
 
     fixture
         .greb(&[&target, &base])
-        .assert_trouble("root commits are not supported");
+        .assert_trouble(&format!("root commit {base} is not supported"));
+}
+
+#[test]
+fn rebase_names_the_root_commit_it_reached() {
+    let Diverged { fixture, .. } = diverged_on_one_file("rebase-root");
+    fixture.git(&["switch", "-q", "--orphan", "unrelated"]);
+    let root = fixture.commit(&[("unrelated.txt", "unrelated\n")]);
+    assert_eq!(fixture.git(&["rev-list", "--count", &root]), "1");
+
+    fixture
+        .greb(&["main"])
+        .assert_trouble(&format!("root commit {root} is not supported"));
 }
 
 #[test]
@@ -639,7 +651,7 @@ fn root_commit_message_cannot_fake_a_parent() {
 
     fixture
         .greb(&[&root, &root])
-        .assert_trouble("root commits are not supported");
+        .assert_trouble(&format!("root commit {root} is not supported"));
 }
 
 #[test]
@@ -676,7 +688,9 @@ fn shallow_cut_is_not_called_a_root_commit() {
         .output()
         .expect("cargo built greb");
 
-    Run::capture(&output).assert_trouble("parent of commit is missing from this shallow clone");
+    Run::capture(&output).assert_trouble(&format!(
+        "parent of {target} is missing from this shallow clone"
+    ));
 }
 
 #[test]
@@ -689,7 +703,7 @@ fn merge_commit_is_trouble_not_a_guess() {
 
     fixture
         .greb(&[&target, &merge])
-        .assert_trouble("merge commits are not supported");
+        .assert_trouble(&format!("merge commit {merge} is not supported"));
 }
 
 #[test]
