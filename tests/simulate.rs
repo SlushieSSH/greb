@@ -165,6 +165,17 @@ impl Fixture {
             unmerged,
         }
     }
+
+    fn delete_loose_object(&self, object: &str) {
+        let (directory, file) = object.split_at(2);
+        let path = self
+            .repo
+            .join(".git")
+            .join("objects")
+            .join(directory)
+            .join(file);
+        fs::remove_file(path).expect("new objects are loose");
+    }
 }
 
 struct Diverged {
@@ -747,14 +758,7 @@ fn git_failure_is_trouble_not_a_verdict() {
     let fixture = Fixture::new("corrupt");
     let (target, commit) = diverged_on_two_files(&fixture);
     let tree = fixture.git(&["rev-parse", &format!("{commit}^{{tree}}")]);
-    let (directory, file) = tree.split_at(2);
-    let tree_object = fixture
-        .repo
-        .join(".git")
-        .join("objects")
-        .join(directory)
-        .join(file);
-    fs::remove_file(tree_object).expect("a new tree is a loose object");
+    fixture.delete_loose_object(&tree);
 
     let run = fixture.greb(&[&target, &commit]);
 
@@ -762,6 +766,31 @@ fn git_failure_is_trouble_not_a_verdict() {
     assert_eq!(run.stdout, "", "{run:?}");
     assert!(
         run.stderr.starts_with("greb: git merge-tree failed"),
+        "{run:?}"
+    );
+}
+
+#[test]
+fn missing_parent_is_not_called_a_shallow_cut() {
+    let fixture = Fixture::new("missing-parent");
+    fixture.commit(&[("a.txt", "base\n"), ("b.txt", "base\n")]);
+    fixture.git(&["switch", "-q", "-c", "feature"]);
+    let parent = fixture.commit(&[("b.txt", "one\n")]);
+    let commit = fixture.commit(&[("b.txt", "two\n")]);
+    fixture.git(&["switch", "-q", "main"]);
+    let target = fixture.commit(&[("a.txt", "target\n")]);
+    fixture.delete_loose_object(&parent);
+    assert_eq!(
+        fixture.git(&["rev-parse", "--is-shallow-repository"]),
+        "false"
+    );
+
+    let run = fixture.greb(&[&target, &commit]);
+
+    assert_eq!(run.code, Some(2), "{run:?}");
+    assert_eq!(run.stdout, "", "{run:?}");
+    assert!(
+        run.stderr.starts_with("greb: git rev-list failed"),
         "{run:?}"
     );
 }
