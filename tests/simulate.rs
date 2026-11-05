@@ -761,6 +761,27 @@ fn merge_commit_is_trouble_not_a_guess() {
 }
 
 #[test]
+fn unsupported_later_commit_is_checked_before_replay() {
+    let Diverged {
+        fixture,
+        base,
+        target,
+        commit,
+    } = diverged_on_one_file("later-unsupported");
+    fixture.git(&["merge", "-q", "-s", "ours", "-m", "fixture merge", &commit]);
+    let merge = fixture.git(&["rev-parse", "HEAD"]);
+    assert_eq!(fixture.git(&["rev-parse", "HEAD^2"]), commit);
+    fixture.greb(&[&target, &commit]).assert_stopped_at(&commit);
+
+    fixture
+        .greb(&[&target, &commit, &base])
+        .assert_trouble(&format!("root commit {base} is not supported"));
+    fixture
+        .greb(&[&target, &commit, &merge])
+        .assert_trouble(&format!("merge commit {merge} is not supported"));
+}
+
+#[test]
 fn no_arguments_is_trouble() {
     let fixture = Fixture::new("arguments");
 
