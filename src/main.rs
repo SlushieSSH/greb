@@ -43,7 +43,9 @@ impl fmt::Display for RepoPath {
                 character,
                 '\u{61c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}'
             );
-            if character.is_control() || is_bidi_control {
+            if character == '\\' {
+                formatter.write_str(r"\\")?;
+            } else if character.is_control() || is_bidi_control {
                 write!(formatter, "{}", character.escape_unicode())?;
             } else {
                 write!(formatter, "{character}")?;

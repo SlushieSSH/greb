@@ -347,6 +347,25 @@ fn file_names_cannot_send_terminal_controls() {
 }
 
 #[test]
+fn backslash_in_file_name_cannot_imitate_an_escape() {
+    let fixture = Fixture::new("backslash-name");
+    let name = r"a\u{1b}[31mred.txt";
+    let base = commit_without_checkout(&fixture, name, "base\n", &[]);
+    let commit = commit_without_checkout(&fixture, name, "feature\n", &[&base]);
+    let target = commit_without_checkout(&fixture, name, "target\n", &[&base]);
+
+    let run = fixture.greb(&[&target, &commit]);
+
+    assert_eq!(run.code, Some(1), "{run:?}");
+    let escaped = r"a\\u{1b}[31mred.txt";
+    assert_eq!(
+        run.stdout,
+        format!("conflict {commit}\n{escaped}\n"),
+        "{run:?}"
+    );
+}
+
+#[test]
 fn only_the_commits_own_change_is_replayed() {
     let fixture = Fixture::new("own-change");
     fixture.commit(&[("shared.txt", "base\n"), ("other.txt", "base\n")]);
