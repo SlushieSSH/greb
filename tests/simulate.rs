@@ -176,6 +176,31 @@ impl Fixture {
             .join(file);
         fs::remove_file(path).expect("new objects are loose");
     }
+
+    fn shallow_clone(&self, tip: &str) -> PathBuf {
+        let clone = self.repo.with_file_name("clone");
+        let clone_path = clone.to_str().expect("fixture paths are UTF-8");
+        let repo_path = self.repo.display().to_string().replace('\\', "/");
+        let source = format!("file:///{}", repo_path.trim_start_matches('/'));
+        self.git(&["clone", "-q", "--depth", "1", &source, clone_path]);
+        assert_eq!(
+            self.git(&["-C", clone_path, "rev-parse", "--is-shallow-repository"]),
+            "true"
+        );
+        assert_eq!(
+            self.git(&[
+                "-C",
+                clone_path,
+                "rev-list",
+                "--parents",
+                "--max-count=1",
+                tip
+            ]),
+            tip,
+            "rev-list must hide the parent here"
+        );
+        clone
+    }
 }
 
 struct Diverged {
@@ -670,27 +695,7 @@ fn shallow_cut_is_not_called_a_root_commit() {
     let Diverged {
         fixture, target, ..
     } = diverged_on_one_file("shallow");
-    let clone = fixture.repo.with_file_name("clone");
-    let clone_path = clone.to_str().expect("fixture paths are UTF-8");
-    let repo_path = fixture.repo.display().to_string().replace('\\', "/");
-    let source = format!("file:///{}", repo_path.trim_start_matches('/'));
-    fixture.git(&["clone", "-q", "--depth", "1", &source, clone_path]);
-    assert_eq!(
-        fixture.git(&["-C", clone_path, "rev-parse", "--is-shallow-repository"]),
-        "true"
-    );
-    assert_eq!(
-        fixture.git(&[
-            "-C",
-            clone_path,
-            "rev-list",
-            "--parents",
-            "--max-count=1",
-            &target
-        ]),
-        target,
-        "rev-list must hide the parent here"
-    );
+    let clone = fixture.shallow_clone(&target);
 
     let output = fixture
         .greb_command()
@@ -702,6 +707,25 @@ fn shallow_cut_is_not_called_a_root_commit() {
     Run::capture(&output).assert_trouble(&format!(
         "parent of {target} is missing from this shallow clone"
     ));
+}
+
+#[test]
+fn shallow_merge_commit_is_not_called_a_shallow_cut() {
+    let fixture = Fixture::new("shallow-merge");
+    let (_, commit) = diverged_on_two_files(&fixture);
+    fixture.git(&["merge", "-q", "--no-ff", "-m", "fixture merge", &commit]);
+    let merge = fixture.git(&["rev-parse", "HEAD"]);
+    assert_eq!(fixture.git(&["rev-parse", "HEAD^2"]), commit);
+    let clone = fixture.shallow_clone(&merge);
+
+    let output = fixture
+        .greb_command()
+        .current_dir(&clone)
+        .args([&merge, &merge])
+        .output()
+        .expect("cargo built greb");
+
+    Run::capture(&output).assert_trouble(&format!("merge commit {merge} is not supported"));
 }
 
 #[test]

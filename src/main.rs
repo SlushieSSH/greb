@@ -181,13 +181,13 @@ fn resolve(revision: &OsStr, peel: &str, role: Role) -> Result<Oid, Trouble> {
     Oid::parse(output.stdout.trim_ascii()).ok_or(Trouble::NotACommit { role })
 }
 
-fn has_recorded_parent(commit: &Oid) -> Result<bool, Trouble> {
+fn recorded_parents(commit: &Oid) -> Result<usize, Trouble> {
     const SUBCOMMAND: &str = "cat-file";
     let stdout = git_stdout(git().args([SUBCOMMAND, "commit"]).arg(commit), SUBCOMMAND)?;
-    let mut header = stdout
+    let header = stdout
         .split(|byte| *byte == b'\n')
         .take_while(|line| !line.is_empty());
-    Ok(header.any(|line| line.starts_with(b"parent ")))
+    Ok(header.filter(|line| line.starts_with(b"parent ")).count())
 }
 
 fn single_parent(commit: &Oid) -> Result<Oid, Trouble> {
@@ -202,10 +202,10 @@ fn single_parent(commit: &Oid) -> Result<Oid, Trouble> {
     let mut parents = stdout.trim_ascii().split(u8::is_ascii_whitespace).skip(1);
     let Some(parent) = parents.next() else {
         let commit = commit.clone();
-        return Err(if has_recorded_parent(&commit)? {
-            Trouble::ShallowCut { commit }
-        } else {
-            Trouble::RootCommit { commit }
+        return Err(match recorded_parents(&commit)? {
+            0 => Trouble::RootCommit { commit },
+            1 => Trouble::ShallowCut { commit },
+            _ => Trouble::MergeCommit { commit },
         });
     };
     if parents.next().is_some() {
