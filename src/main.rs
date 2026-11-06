@@ -38,17 +38,26 @@ struct RepoPath(Vec<u8>);
 
 impl fmt::Display for RepoPath {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        for character in String::from_utf8_lossy(&self.0).chars() {
-            let is_bidi_control = matches!(
-                character,
-                '\u{61c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}'
-            );
-            if character == '\\' {
-                formatter.write_str(r"\\")?;
-            } else if character.is_control() || is_bidi_control {
-                write!(formatter, "{}", character.escape_unicode())?;
-            } else {
-                write!(formatter, "{character}")?;
+        for chunk in self.0.utf8_chunks() {
+            for character in chunk.valid().chars() {
+                let is_bidi_control = matches!(
+                    character,
+                    '\u{61c}'
+                        | '\u{200e}'
+                        | '\u{200f}'
+                        | '\u{202a}'..='\u{202e}'
+                        | '\u{2066}'..='\u{2069}'
+                );
+                if character == '\\' {
+                    formatter.write_str(r"\\")?;
+                } else if character.is_control() || is_bidi_control {
+                    write!(formatter, "{}", character.escape_unicode())?;
+                } else {
+                    write!(formatter, "{character}")?;
+                }
+            }
+            for byte in chunk.invalid() {
+                write!(formatter, "\\x{byte:02x}")?;
             }
         }
         Ok(())

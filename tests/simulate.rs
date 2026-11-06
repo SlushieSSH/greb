@@ -1,4 +1,5 @@
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{self, Command, Output, Stdio};
 
@@ -302,24 +303,46 @@ fn conflict_lists_the_files_git_leaves_unmerged() {
 
 fn commit_without_checkout(
     fixture: &Fixture,
-    path: &str,
+    path: impl AsRef<[u8]>,
     contents: &str,
     parents: &[&str],
 ) -> String {
+    let path = path.as_ref();
     let blob_file = fixture.home.join("blob");
     fs::write(&blob_file, contents).expect("home is writable");
     let blob_path = blob_file.to_str().expect("fixture paths are UTF-8");
     let blob = fixture.git(&["hash-object", "-w", blob_path]);
-    let cacheinfo = format!("100644,{blob},{path}");
-    fixture.git(&[
-        "-c",
-        "core.protectNTFS=false",
-        "update-index",
-        "--add",
-        "--cacheinfo",
-        &cacheinfo,
-    ]);
+    let mut entry = format!("100644 blob {blob}\t").into_bytes();
+    entry.extend_from_slice(path);
+    entry.push(0);
+    let mut update_index = fixture
+        .in_repo("git")
+        .args([
+            "-c",
+            "core.protectNTFS=false",
+            "update-index",
+            "-z",
+            "--index-info",
+        ])
+        .stdin(Stdio::piped())
+        .spawn()
+        .expect("git is installed");
+    update_index
+        .stdin
+        .take()
+        .expect("stdin was piped")
+        .write_all(&entry)
+        .expect("update-index reads the entry");
+    let status = update_index.wait().expect("update-index was spawned");
+    assert!(status.success(), "update-index rejected {path:?}");
     let tree = fixture.git(&["write-tree"]);
+    let ls_tree = fixture
+        .in_repo("git")
+        .args(["ls-tree", "-z", "--name-only", &tree])
+        .output()
+        .expect("git is installed");
+    assert!(ls_tree.status.success());
+    assert_eq!(ls_tree.stdout.strip_suffix(b"\0"), Some(path));
     let mut arguments = vec!["commit-tree", &tree, "-m", "fixture commit"];
     for parent in parents {
         arguments.extend(["-p", parent]);
@@ -358,6 +381,25 @@ fn backslash_in_file_name_cannot_imitate_an_escape() {
 
     assert_eq!(run.code, Some(1), "{run:?}");
     let escaped = r"a\\u{1b}[31mred.txt";
+    assert_eq!(
+        run.stdout,
+        format!("conflict {commit}\n{escaped}\n"),
+        "{run:?}"
+    );
+}
+
+#[test]
+fn non_utf8_file_name_is_escaped_by_byte() {
+    let fixture = Fixture::new("non-utf8-name");
+    let name = b"caf\xe9.txt";
+    let base = commit_without_checkout(&fixture, name, "base\n", &[]);
+    let commit = commit_without_checkout(&fixture, name, "feature\n", &[&base]);
+    let target = commit_without_checkout(&fixture, name, "target\n", &[&base]);
+
+    let run = fixture.greb(&[&target, &commit]);
+
+    assert_eq!(run.code, Some(1), "{run:?}");
+    let escaped = r"caf\xe9.txt";
     assert_eq!(
         run.stdout,
         format!("conflict {commit}\n{escaped}\n"),
