@@ -1,8 +1,10 @@
 use std::env;
 use std::ffi::{OsStr, OsString};
 use std::fmt;
+use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
-use std::process::{Command, ExitCode, ExitStatus, Stdio};
+use std::path::{Path, PathBuf};
+use std::process::{self, Command, ExitCode, ExitStatus, Stdio};
 
 const CONFLICT_EXIT_CODE: u8 = 1;
 const TROUBLE_EXIT_CODE: u8 = 2;
@@ -117,6 +119,7 @@ enum Trouble {
     UnexpectedOutput {
         subcommand: &'static str,
     },
+    ScratchFailed(io::Error),
     StdoutFailed(io::Error),
 }
 
@@ -149,6 +152,9 @@ impl fmt::Display for Trouble {
             }
             Self::UnexpectedOutput { subcommand } => {
                 write!(formatter, "git {subcommand} printed something unexpected")
+            }
+            Self::ScratchFailed(error) => {
+                write!(formatter, "cannot prepare scratch objects: {error}")
             }
             Self::StdoutFailed(error) => write!(formatter, "cannot write to stdout: {error}"),
         }
@@ -259,13 +265,88 @@ fn rebased_commits(target: &Oid, head: &Oid) -> Result<Vec<Oid>, Trouble> {
         .collect()
 }
 
-fn replay(onto: &Oid, commit: Oid, parent: &Oid) -> Result<Outcome, Trouble> {
+struct ScratchObjects {
+    path: PathBuf,
+}
+
+impl ScratchObjects {
+    fn new(repo_objects: &[u8]) -> Result<Self, Trouble> {
+        let base = env::temp_dir();
+        let pid = process::id();
+        let mut attempt: u32 = 0;
+        let scratch = loop {
+            let candidate = base.join(format!("greb-{pid}-{attempt}"));
+            match fs::create_dir(&candidate) {
+                Ok(()) => break Self { path: candidate },
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                    attempt = attempt.checked_add(1).ok_or_else(|| {
+                        Trouble::ScratchFailed(io::Error::from(io::ErrorKind::AlreadyExists))
+                    })?;
+                }
+                Err(error) => return Err(Trouble::ScratchFailed(error)),
+            }
+        };
+        let info = scratch.path.join("info");
+        fs::create_dir(&info).map_err(Trouble::ScratchFailed)?;
+        let mut alternates = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(info.join("alternates"))
+            .map_err(Trouble::ScratchFailed)?;
+        alternates
+            .write_all(repo_objects)
+            .map_err(Trouble::ScratchFailed)?;
+        Ok(scratch)
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for ScratchObjects {
+    fn drop(&mut self) {
+        #[expect(
+            let_underscore_drop,
+            clippy::let_underscore_must_use,
+            reason = "cleanup in drop has nowhere to report a failure"
+        )]
+        let _ = fs::remove_dir_all(&self.path);
+    }
+}
+
+fn object_directory() -> Result<Vec<u8>, Trouble> {
+    const SUBCOMMAND: &str = "rev-parse";
+    let stdout = git_stdout(
+        git().args([
+            SUBCOMMAND,
+            "--path-format=absolute",
+            "--git-path",
+            "objects",
+        ]),
+        SUBCOMMAND,
+    )?;
+    if stdout.trim_ascii().is_empty() {
+        return Err(Trouble::UnexpectedOutput {
+            subcommand: SUBCOMMAND,
+        });
+    }
+    Ok(stdout)
+}
+
+fn replay(
+    scratch: &ScratchObjects,
+    onto: &Oid,
+    commit: Oid,
+    parent: &Oid,
+) -> Result<Outcome, Trouble> {
     const SUBCOMMAND: &str = "merge-tree";
     let mut attribute_source = OsString::from("--attr-source=");
     attribute_source.push(onto);
     let mut merge_base = OsString::from("--merge-base=");
     merge_base.push(parent);
     let output = git()
+        .env("GIT_OBJECT_DIRECTORY", scratch.path())
         .arg(attribute_source)
         .args([SUBCOMMAND, "--write-tree", "-z", "--name-only"])
         .arg(merge_base)
@@ -327,8 +408,13 @@ fn simulate() -> Result<Outcome, Trouble> {
         })
         .collect::<Result<Vec<_>, Trouble>>()?;
     let mut onto = resolve(target.as_ref(), "^{tree}", Role::Target)?;
+    if steps.is_empty() {
+        return Ok(Outcome::Clean { tree: onto });
+    }
+    let repo_objects = object_directory()?;
+    let scratch = ScratchObjects::new(&repo_objects)?;
     for (commit, parent) in steps {
-        match replay(&onto, commit, &parent)? {
+        match replay(&scratch, &onto, commit, &parent)? {
             Outcome::Clean { tree } => onto = tree,
             conflict @ Outcome::Conflict { .. } => return Ok(conflict),
         }

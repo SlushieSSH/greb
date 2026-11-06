@@ -275,6 +275,39 @@ fn conflicting_commit_stops_cherry_pick_too() {
 }
 
 #[test]
+fn replay_does_not_write_objects_to_the_repository() {
+    let fixture = Fixture::new("no-repo-writes");
+    fixture.commit(&[("shared.txt", "base\n"), ("other.txt", "base\n")]);
+    fixture.git(&["switch", "-q", "-c", "feature"]);
+    let clean = fixture.commit(&[("other.txt", "feature\n")]);
+    let conflicting = fixture.commit(&[("shared.txt", "feature\n")]);
+    fixture.git(&["switch", "-q", "main"]);
+    let target = fixture.commit(&[("shared.txt", "target\n")]);
+    let objects_before = fixture.git(&["count-objects", "-v"]);
+
+    let clean_run = fixture.greb(&[&target, &clean]);
+    let conflict_run = fixture.greb(&[&target, &conflicting]);
+
+    assert_eq!(fixture.git(&["count-objects", "-v"]), objects_before);
+    let merged_tree = clean_run
+        .stdout
+        .strip_prefix("clean ")
+        .expect("clean run")
+        .trim();
+    let probe = fixture
+        .in_repo("git")
+        .args(["cat-file", "-e", merged_tree])
+        .output()
+        .expect("git is installed");
+    assert!(
+        !probe.status.success(),
+        "merged tree was written to the repo"
+    );
+    clean_run.assert_clean(&fixture.cherry_pick_tree(&target, &[&clean]));
+    conflict_run.assert_conflict(&fixture.cherry_pick_stop(&target, &[&conflicting]));
+}
+
+#[test]
 fn conflict_lists_the_files_git_leaves_unmerged() {
     let fixture = Fixture::new("unmerged-files");
     fs::create_dir(fixture.repo.join("docs")).expect("the fixture repo is writable");
